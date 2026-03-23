@@ -25,4 +25,4 @@ Uses the `uv tool` sub-command under the hood.
 
 - Show the list of installed tools.
 - Highlighting a tool shows its details in the right pane: its directory (the base directory name is obtained with `uv tool dir`).
-- Selecting a tool will ask to uninstall it.
+- Selecting a tool will ask to upgrade or uninstall it.

@@ -14,6 +14,7 @@ require_cmd fzf
 require_cmd jq
 
 UV_PYTHON_DIR="$(uv python dir)"
+UV_TOOL_DIR="$(uv tool dir)"
 
 python_versions_build_rows() {
   uv python list --managed-python --output-format json | jq -r '
@@ -54,6 +55,7 @@ python_versions_build_rows() {
 }
 
 python_versions_preview() {
+  set +e
   local row="$1"
   local display_key status key version path
   IFS=$'\t' read -r display_key status key version path <<<"$row"
@@ -78,16 +80,12 @@ python_versions_preview() {
   # Terminal hyperlink (OSC 8), when supported.
   local display_dir="${dir/#$HOME/\~}"
   printf 'Directory: \e]8;;file://%s\e\\%s\e]8;;\e\\\n' "$dir" "$display_dir"
+  return 0
 }
-
-if [[ "${1-}" == "--preview" ]]; then
-  python_versions_preview "${2-}"
-  exit 0
-fi
 
 confirm() {
   local header="$1"
-  local picked key
+  local picked keypress
 
   picked="$(printf 'Yes\nNo\n' | fzf \
     --height=10% \
@@ -109,6 +107,105 @@ confirm() {
   picked="$(printf '%s\n' "$picked" | sed -n '2p')"
   [[ "$picked" == "Yes" ]]
 }
+
+pick_action() {
+  local header="$1"
+  shift
+
+  local picked keypress choice
+  picked="$(printf '%s\n' "$@" | fzf \
+    --height=10% \
+    --layout=reverse \
+    --border \
+    --no-sort \
+    --expect=esc,ctrl-c \
+    --header="$header" \
+    --prompt='Action> ')"
+
+  keypress="$(printf '%s\n' "$picked" | sed -n '1p')"
+  if [[ "$keypress" == "ctrl-c" ]]; then
+    exit 1
+  fi
+  if [[ "$keypress" == "esc" ]]; then
+    return 1
+  fi
+
+  choice="$(printf '%s\n' "$picked" | sed -n '2p')"
+  if [[ -z "$choice" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "$choice"
+}
+
+uv_tools_build_rows() {
+  local line name version path status display
+
+  while IFS= read -r line; do
+    name="$(printf '%s\n' "$line" | sed -n 's/^warning: Tool `\([^`]*\)` environment not found.*$/\1/p')"
+    if [[ -n "$name" ]]; then
+      status="broken"
+      display="! ${name}"
+      version="unavailable"
+      path="${UV_TOOL_DIR}/${name}"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$display" "$name" "$status" "$version" "$path"
+      continue
+    fi
+
+    if [[ "$line" =~ ^([^[:space:]]+)\ v([^[:space:]]+)\ \((.*)\)$ ]]; then
+      name="${BASH_REMATCH[1]}"
+      version="${BASH_REMATCH[2]}"
+      path="${BASH_REMATCH[3]}"
+      status="installed"
+      display="  ${name}"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$display" "$name" "$status" "$version" "$path"
+    fi
+  done < <(uv tool list --show-paths 2>&1)
+}
+
+uv_tools_preview() {
+  set +e
+  local row="$1"
+  local _display="" name="" status="" version="" path=""
+  IFS=$'\t' read -r _display name status version path <<<"$row"
+
+  local dir="$path"
+  if [[ -z "$dir" ]]; then
+    dir="${UV_TOOL_DIR}/${name}"
+  fi
+
+  local size="missing"
+  if [[ -d "$dir" ]]; then
+    size="$(du -shL "$dir" 2>/dev/null | awk '{print $1}')"
+  fi
+
+  printf 'Status: %s\n' "$status"
+  printf 'Version: %s\n' "$version"
+  printf 'Tool: %s\n' "$name"
+  if [[ "$status" == "broken" ]]; then
+    printf 'Problem: Environment missing. Run: uv tool install %s --reinstall\n' "$name"
+  fi
+  printf 'Size: %s\n\n' "$size"
+
+  local display_dir="${dir/#$HOME/\~}"
+  printf 'Directory: \e]8;;file://%s\e\\%s\e]8;;\e\\\n' "$dir" "$display_dir"
+  return 0
+}
+
+if [[ "${1-}" == "--preview" ]]; then
+  case "${2-}" in
+    python)
+      python_versions_preview "${3-}"
+      ;;
+    tool)
+      uv_tools_preview "${3-}"
+      ;;
+    *)
+      python_versions_preview "${2-}"
+      ;;
+  esac
+  exit 0
+fi
 
 python_versions_picker() {
   local rows
@@ -133,8 +230,8 @@ python_versions_picker() {
       --footer='Filters: installed available clear' \
       --footer-border \
       --bind='click-footer:transform:case "$FZF_CLICK_FOOTER_WORD" in installed|available) echo "change-query($FZF_CLICK_FOOTER_WORD)+first" ;; clear) echo "clear-query+first" ;; esac' \
-      --preview="$0 --preview {}" \
-      --preview-window='right,60%,border-left'
+      --preview="$0 --preview python {}" \
+      --preview-window='right,border-left'
   )"
 
   keypress="$(printf '%s\n' "$selected" | sed -n '1p')"
@@ -198,7 +295,69 @@ run_uv_cache() {
 }
 
 run_uv_tools() {
-  echo "TODO: uv tool (install, uninstall, upgrade)"
+  local rows selected keypress _display name status version path action
+
+  while true; do
+    rows="$(uv_tools_build_rows)"
+    if [[ -z "$rows" ]]; then
+      echo "No uv tools returned by uv." >&2
+      return 0
+    fi
+
+    selected="$(
+      printf '%s\n' "$rows" | fzf \
+        --height=100% \
+        --layout=reverse \
+        --border \
+        --delimiter=$'\t' \
+        --expect=esc,ctrl-c \
+        --with-nth=1 \
+        --bind='focus:transform-header:case {3} in broken) echo "Enter: choose action (reinstall/uninstall) | Esc: back | Ctrl-C: quit" ;; *) echo "Enter: choose action (upgrade/uninstall) | Esc: back | Ctrl-C: quit" ;; esac' \
+        --preview="$0 --preview tool {}" \
+        --preview-window='right,border-left'
+    )"
+
+    keypress="$(printf '%s\n' "$selected" | sed -n '1p')"
+    if [[ "$keypress" == "ctrl-c" ]]; then
+      exit 1
+    fi
+    if [[ "$keypress" == "esc" ]]; then
+      return 0
+    fi
+    selected="$(printf '%s\n' "$selected" | sed -n '2p')"
+
+    IFS=$'\t' read -r _display name status version path <<<"$selected"
+
+    if [[ "$status" == "broken" ]]; then
+      if ! action="$(pick_action "${name} | broken" "Reinstall" "Uninstall")"; then
+        continue
+      fi
+    else
+      if ! action="$(pick_action "${name} | installed" "Upgrade" "Uninstall")"; then
+        continue
+      fi
+    fi
+
+    if ! confirm "${action} ${name}?"; then
+      continue
+    fi
+
+    echo
+    case "$action" in
+      Reinstall)
+        uv tool install "$name" --reinstall
+        ;;
+      Upgrade)
+        uv tool upgrade "$name"
+        ;;
+      Uninstall)
+        uv tool uninstall "$name"
+        ;;
+    esac
+    echo
+    read -r -s -p "Press Enter to continue..."
+    echo
+  done
 }
 
 main_menu() {
